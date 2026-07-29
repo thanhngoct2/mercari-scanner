@@ -25,7 +25,6 @@ KEYWORDS = [
     "チャネル　デニム",
     "CHANEL ジャケット",
     "CHANEL テーラージャケット",
-　　"CHANEL ニットセーター",
 　　"CHANEL シャツ",
 　　"CHANEL 半袖",
 　　"CHANEL セットアップ",
@@ -33,8 +32,7 @@ KEYWORDS = [
 　　"DIOR トップス",
 　　"DIOR ブラウス",
  　 "DIOR シャツ",
-    "DIOR ニットセーター",
-　　"DIOR ワンピース",
+ 　　"DIOR ワンピース",
 
 ]
 
