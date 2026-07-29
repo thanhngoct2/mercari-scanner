@@ -1,1 +1,1 @@
-worker: python mercari scanner.py
+worker: python mercari_scanner.py
