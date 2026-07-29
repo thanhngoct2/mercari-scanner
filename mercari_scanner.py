@@ -18,22 +18,23 @@ import os
 
 # --- Từ khóa tìm kiếm (tiếng Nhật hoặc tiếng Anh) ---
 KEYWORDS = [
-   "シャネル トップス",
+  "シャネル トップス",
     "CHANEL トップス",
     "シャネル ブラウス",
     "シャネル カットソー",
-    "チャネル　デニム",
+    "チャネル デニム",
     "CHANEL ジャケット",
     "CHANEL テーラージャケット",
-　　"CHANEL シャツ",
-　　"CHANEL 半袖",
-　　"CHANEL セットアップ",
-　　"CHANEL ワンピース",
-　　"DIOR トップス",
-　　"DIOR ブラウス",
- 　 "DIOR シャツ",
- 　　"DIOR ワンピース",
-
+    "CHANEL ニットセーター",
+    "CHANEL シャツ",
+    "CHANEL 半袖",
+    "CHANEL セットアップ",
+    "CHANEL ワンピース",
+    "DIOR トップス",
+    "DIOR ブラウス",
+    "DIOR シャツ",
+    "DIOR ニットセーター",
+    "DIOR ワンピース",
 ]
 
 # --- Lọc giá (đơn vị: Yên Nhật). Đặt 0 để bỏ qua ---
