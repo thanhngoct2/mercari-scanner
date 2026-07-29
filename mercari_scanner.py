@@ -1,11 +1,11 @@
 import os
-import re
 import json
 import time
 import logging
 from datetime import datetime
 
 import requests
+from playwright.sync_api import sync_playwright
 
 KEYWORDS = [
     "シャネル トップス",
@@ -27,22 +27,10 @@ KEYWORDS = [
     "DIOR ワンピース",
 ]
 
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "90"))
-PRICE_MIN = os.environ.get("PRICE_MIN", "")
-PRICE_MAX = os.environ.get("PRICE_MAX", "")
-
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "180"))
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
 SEEN_ITEMS_FILE = os.environ.get("SEEN_ITEMS_FILE", "seen_items.json")
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ja-JP,ja;q=0.9",
-}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mercari_scanner")
@@ -66,43 +54,6 @@ def save_seen_items(seen_ids):
         json.dump(ids_list, f)
 
 
-def build_search_url(keyword: str) -> str:
-    url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale"
-    if PRICE_MIN:
-        url += f"&price_min={PRICE_MIN}"
-    if PRICE_MAX:
-        url += f"&price_max={PRICE_MAX}"
-    return url
-
-
-def fetch_next_data(url: str, keyword: str):
-    global _debug_done
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-
-    if not _debug_done:
-        _debug_done = True
-        log.info("[DEBUG] Ma trang: %s | Do dai HTML: %d", resp.status_code, len(resp.text))
-        has_next_data = '__NEXT_DATA__' in resp.text
-        log.info("[DEBUG] Co the __NEXT_DATA__ khong: %s", has_next_data)
-        script_ids = re.findall(r'<script[^>]*id="([^"]+)"', resp.text)
-        log.info("[DEBUG] Cac script id tim thay: %s", script_ids[:20])
-        if not has_next_data:
-            log.info("[DEBUG] 800 ky tu dau HTML: %s", resp.text[:800])
-
-    match = re.search(
-        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-        resp.text,
-        re.DOTALL,
-    )
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-
-
 def find_items_recursive(node, found=None):
     if found is None:
         found = []
@@ -118,26 +69,44 @@ def find_items_recursive(node, found=None):
     return found
 
 
-def extract_items_from_next_data(next_data) -> list:
-    if not next_data:
+def scan_keyword_with_browser(page, keyword: str) -> list:
+    global _debug_done
+    captured_json = []
+
+    def handle_response(response):
+        try:
+            ctype = response.headers.get("content-type", "")
+            if "application/json" in ctype and response.status == 200:
+                body = response.json()
+                captured_json.append(body)
+        except Exception:
+            pass
+
+    page.on("response", handle_response)
+
+    url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale"
+    try:
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(2000)
+    except Exception as e:
+        log.error("Loi khi mo trang cho tu khoa '%s': %s", keyword, e)
+        page.remove_listener("response", handle_response)
         return []
-    items = find_items_recursive(next_data)
+
+    page.remove_listener("response", handle_response)
+
+    if not _debug_done:
+        _debug_done = True
+        log.info("[DEBUG] So goi JSON bat duoc: %d", len(captured_json))
+
+    all_items = []
+    for blob in captured_json:
+        all_items.extend(find_items_recursive(blob))
+
     unique = {}
-    for item in items:
+    for item in all_items:
         unique[item["id"]] = item
     return list(unique.values())
-
-
-def scan_keyword(keyword: str) -> list:
-    url = build_search_url(keyword)
-    try:
-        next_data = fetch_next_data(url, keyword)
-    except requests.RequestException as e:
-        log.error("Loi khi goi Mercari cho tu khoa '%s': %s", keyword, e)
-        return []
-    items = extract_items_from_next_data(next_data)
-    log.info("Tu khoa '%s': tim thay %d item.", keyword, len(items))
-    return items
 
 
 def send_telegram_message(text: str):
@@ -168,29 +137,53 @@ def format_item_message(item: dict, keyword: str) -> str:
 
 
 def main():
-    log.info("Bat dau mercari_scanner - tu khoa: %s", KEYWORDS)
+    log.info("Bat dau mercari_scanner (che do trinh duyet ao) - tu khoa: %s", KEYWORDS)
     seen_ids = load_seen_items()
     log.info("Da co %d item trong lich su.", len(seen_ids))
 
-    while True:
-        for keyword in KEYWORDS:
-            keyword = keyword.strip()
-            if not keyword:
-                continue
-            items = scan_keyword(keyword)
-            new_items = [i for i in items if str(i.get("id")) not in seen_ids]
-            for item in new_items:
-                item_id = str(item.get("id"))
-                seen_ids.add(item_id)
-                send_telegram_message(format_item_message(item, keyword))
-                log.info("Da bao hang moi: %s (%s)", item.get("name"), item_id)
-            if new_items:
-                save_seen_items(seen_ids)
-            time.sleep(3)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="ja-JP",
+        )
+        page = context.new_page()
 
-        log.info("Hoan tat 1 vong quet luc %s - cho %ds.", datetime.now().strftime("%H:%M:%S"), SCAN_INTERVAL_SECONDS)
-        time.sleep(SCAN_INTERVAL_SECONDS)
+        while True:
+            for keyword in KEYWORDS:
+                keyword = keyword.strip()
+                if not keyword:
+                    continue
+                try:
+                    items = scan_keyword_with_browser(page, keyword)
+                except Exception as e:
+                    log.error("Loi khong xac dinh voi tu khoa '%s': %s", keyword, e)
+                    items = []
+
+                log.info("Tu khoa '%s': tim thay %d item.", keyword, len(items))
+
+                new_items = [i for i in items if str(i.get("id")) not in seen_ids]
+                for item in new_items:
+                    item_id = str(item.get("id"))
+                    seen_ids.add(item_id)
+                    send_telegram_message(format_item_message(item, keyword))
+                    log.info("Da bao hang moi: %s (%s)", item.get("name"), item_id)
+                if new_items:
+                    save_seen_items(seen_ids)
+
+                time.sleep(3)
+
+            log.info(
+                "Hoan tat 1 vong quet luc %s - cho %ds.",
+                datetime.now().strftime("%H:%M:%S"),
+                SCAN_INTERVAL_SECONDS,
+            )
+            time.sleep(SCAN_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
     main()
+    for blob in captured_json:
