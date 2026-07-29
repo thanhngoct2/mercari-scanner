@@ -47,6 +47,8 @@ HEADERS = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mercari_scanner")
 
+_debug_done = False
+
 
 def load_seen_items():
     if os.path.exists(SEEN_ITEMS_FILE):
@@ -73,9 +75,21 @@ def build_search_url(keyword: str) -> str:
     return url
 
 
-def fetch_next_data(url: str):
+def fetch_next_data(url: str, keyword: str):
+    global _debug_done
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
+
+    if not _debug_done:
+        _debug_done = True
+        log.info("[DEBUG] Ma trang: %s | Do dai HTML: %d", resp.status_code, len(resp.text))
+        has_next_data = '__NEXT_DATA__' in resp.text
+        log.info("[DEBUG] Co the __NEXT_DATA__ khong: %s", has_next_data)
+        script_ids = re.findall(r'<script[^>]*id="([^"]+)"', resp.text)
+        log.info("[DEBUG] Cac script id tim thay: %s", script_ids[:20])
+        if not has_next_data:
+            log.info("[DEBUG] 800 ky tu dau HTML: %s", resp.text[:800])
+
     match = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         resp.text,
@@ -117,7 +131,7 @@ def extract_items_from_next_data(next_data) -> list:
 def scan_keyword(keyword: str) -> list:
     url = build_search_url(keyword)
     try:
-        next_data = fetch_next_data(url)
+        next_data = fetch_next_data(url, keyword)
     except requests.RequestException as e:
         log.error("Loi khi goi Mercari cho tu khoa '%s': %s", keyword, e)
         return []
