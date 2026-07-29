@@ -1,24 +1,14 @@
-"""
-Mercari JP Scanner
-==================
-Tự động quét Mercari Nhật và gửi thông báo về Telegram + Discord
-khi có listing mới khớp với từ khóa của bạn.
-
-Tác giả: Claude (Anthropic)
-"""
+import os
+import re
+import json
+import time
+import logging
+from datetime import datetime
 
 import requests
-import time
-import json
-import os
 
-# ============================================================
-# ⚙️  CÀI ĐẶT CỦA BẠN — Chỉnh sửa phần này trước khi chạy
-# ============================================================
-
-# --- Từ khóa tìm kiếm (tiếng Nhật hoặc tiếng Anh) ---
 KEYWORDS = [
-  "シャネル トップス",
+    "シャネル トップス",
     "CHANEL トップス",
     "シャネル ブラウス",
     "シャネル カットソー",
@@ -37,200 +27,155 @@ KEYWORDS = [
     "DIOR ワンピース",
 ]
 
-# --- Lọc giá (đơn vị: Yên Nhật). Đặt 0 để bỏ qua ---
-MIN_PRICE = 0       # Ví dụ: 1000
-MAX_PRICE = 0       # Ví dụ: 50000
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "90"))
+PRICE_MIN = os.environ.get("PRICE_MIN", "")
+PRICE_MAX = os.environ.get("PRICE_MAX", "")
 
-# --- Tốc độ quét (giây). Tối thiểu 30 để tránh bị block ---
-SCAN_INTERVAL = 5
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# --- Telegram ---
-TELEGRAM_ENABLED = True
-TELEGRAM_BOT_TOKEN = "8502880381:AAFJ7L9Ijd40fqPzJd7P2DXZSwkXbKhuSXc"   # Xem hướng dẫn bên dưới
-TELEGRAM_CHAT_ID   = "7489860569"      # Xem hướng dẫn bên dưới
-
-# --- Discord ---
-DISCORD_ENABLED = True
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1514093408094781450/wzNAcLlZFJ2f8mLNLFGxFDfEjv8XSHW3lo8_GB980k-Xcf7ePJmO0XEFovHk5idOGOYN"  # Xem hướng dẫn bên dưới
-
-# ============================================================
-# 🔧  PHẦN KỸ THUẬT — Không cần chỉnh sửa
-# ============================================================
-
-SEEN_IDS_FILE = "seen_ids.json"
-MERCARI_API   = "https://api.mercari.jp/v2/entities:search"
+SEEN_ITEMS_FILE = os.environ.get("SEEN_ITEMS_FILE", "seen_items.json")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-    "X-Platform": "web",
-    "DPoP": "dummy",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja-JP,ja;q=0.9",
 }
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("mercari_scanner")
 
-def load_seen_ids():
-    if os.path.exists(SEEN_IDS_FILE):
-        with open(SEEN_IDS_FILE, "r") as f:
-            return set(json.load(f))
+
+def load_seen_items():
+    if os.path.exists(SEEN_ITEMS_FILE):
+        try:
+            with open(SEEN_ITEMS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
     return set()
 
 
-def save_seen_ids(seen_ids):
-    with open(SEEN_IDS_FILE, "w") as f:
-        json.dump(list(seen_ids), f)
+def save_seen_items(seen_ids):
+    ids_list = list(seen_ids)[-5000:]
+    with open(SEEN_ITEMS_FILE, "w", encoding="utf-8") as f:
+        json.dump(ids_list, f)
 
 
-def search_mercari(keyword):
-    payload = {
-        "pageSize": 30,
-        "pageToken": "",
-        "searchSessionId": "scanner",
-        "indexRouting": "INDEX_ROUTING_UNSPECIFIED",
-        "thumbnailTypes": [],
-        "searchCondition": {
-            "keyword": keyword,
-            "excludeKeyword": "",
-            "sort": "SORT_CREATED_TIME",
-            "order": "ORDER_DESC",
-            "status": ["STATUS_ON_SALE"],
-            "sizeId": [],
-            "categoryId": [],
-            "brandId": [],
-            "sellerId": [],
-            "priceMin": MIN_PRICE if MIN_PRICE > 0 else 0,
-            "priceMax": MAX_PRICE if MAX_PRICE > 0 else 0,
-            "itemConditionId": [],
-            "shippingPayerId": [],
-            "shippingFromArea": [],
-            "shippingMethod": [],
-            "colorId": [],
-            "hasCoupon": False,
-            "attributes": [],
-            "itemTypes": [],
-            "skuIds": [],
-        },
-        "userId": "",
-        "pageInfo": {"page": 0, "limit": 30},
-    }
-    try:
-        r = requests.post(MERCARI_API, headers=HEADERS, json=payload, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("items", [])
-    except Exception as e:
-        print(f"  [Lỗi khi tìm '{keyword}'] {e}")
-        return []
+def build_search_url(keyword: str) -> str:
+    url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale"
+    if PRICE_MIN:
+        url += f"&price_min={PRICE_MIN}"
+    if PRICE_MAX:
+        url += f"&price_max={PRICE_MAX}"
+    return url
 
 
-def send_telegram(item):
-    if not TELEGRAM_ENABLED:
-        return
-    name  = item.get("name", "Không rõ tên")
-    price = item.get("price", "?")
-    item_id = item.get("id", "")
-    url   = f"https://jp.mercari.com/item/{item_id}"
-    img   = (item.get("thumbnails") or [""])[0]
-
-    text = (
-        f"🛍️ *Listing mới trên Mercari JP!*\n\n"
-        f"📦 *{name}*\n"
-        f"💴 ¥{price:,}\n"
-        f"🔗 [Xem sản phẩm]({url})"
+def fetch_next_data(url: str):
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        resp.text,
+        re.DOTALL,
     )
+    if not match:
+        return None
     try:
-        if img:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "photo": img,
-                      "caption": text, "parse_mode": "Markdown"},
-                timeout=10,
-            )
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def find_items_recursive(node, found=None):
+    if found is None:
+        found = []
+    if isinstance(node, dict):
+        if {"id", "name", "price"}.issubset(node.keys()):
+            found.append(node)
         else:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                      "parse_mode": "Markdown"},
-                timeout=10,
-            )
-    except Exception as e:
-        print(f"  [Lỗi Telegram] {e}")
+            for value in node.values():
+                find_items_recursive(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            find_items_recursive(value, found)
+    return found
 
 
-def send_discord(item):
-    if not DISCORD_ENABLED:
-        return
-    name  = item.get("name", "Không rõ tên")
-    price = item.get("price", "?")
-    item_id = item.get("id", "")
-    url   = f"https://jp.mercari.com/item/{item_id}"
-    img   = (item.get("thumbnails") or [""])[0]
+def extract_items_from_next_data(next_data) -> list:
+    if not next_data:
+        return []
+    items = find_items_recursive(next_data)
+    unique = {}
+    for item in items:
+        unique[item["id"]] = item
+    return list(unique.values())
 
-    embed = {
-        "title": f"🛍️ {name}",
-        "url": url,
-        "color": 0xFF4F00,
-        "fields": [
-            {"name": "Giá", "value": f"¥{price:,}", "inline": True},
-            {"name": "Link", "value": f"[Mở Mercari JP]({url})", "inline": True},
-        ],
-        "footer": {"text": "Mercari JP Scanner"},
-    }
-    if img:
-        embed["thumbnail"] = {"url": img}
 
+def scan_keyword(keyword: str) -> list:
+    url = build_search_url(keyword)
     try:
-        requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"embeds": [embed]},
+        next_data = fetch_next_data(url)
+    except requests.RequestException as e:
+        log.error("Loi khi goi Mercari cho tu khoa '%s': %s", keyword, e)
+        return []
+    items = extract_items_from_next_data(next_data)
+    log.info("Tu khoa '%s': tim thay %d item.", keyword, len(items))
+    return items
+
+
+def send_telegram_message(text: str):
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            api_url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
             timeout=10,
         )
-    except Exception as e:
-        print(f"  [Lỗi Discord] {e}")
+        if resp.status_code != 200:
+            log.error("Gui Telegram that bai: %s", resp.text)
+    except requests.RequestException as e:
+        log.error("Loi ket noi Telegram: %s", e)
+
+
+def format_item_message(item: dict, keyword: str) -> str:
+    item_id = item.get("id", "")
+    name = item.get("name", "(khong co ten)")
+    price = item.get("price", "?")
+    item_url = f"https://jp.mercari.com/item/{item_id}"
+    return f"Hang moi: {keyword}\n{name}\nGia: {price} yen\n{item_url}"
 
 
 def main():
-    print("=" * 50)
-    print("  🔍 Mercari JP Scanner đang chạy...")
-    print(f"  Từ khóa: {', '.join(KEYWORDS)}")
-    print(f"  Quét mỗi: {SCAN_INTERVAL} giây")
-    if MIN_PRICE or MAX_PRICE:
-        print(f"  Giá: ¥{MIN_PRICE:,} ~ ¥{MAX_PRICE:,}")
-    print("  Nhấn Ctrl+C để dừng")
-    print("=" * 50)
-
-    seen_ids = load_seen_ids()
-    first_run = len(seen_ids) == 0
+    log.info("Bat dau mercari_scanner - tu khoa: %s", KEYWORDS)
+    seen_ids = load_seen_items()
+    log.info("Da co %d item trong lich su.", len(seen_ids))
 
     while True:
         for keyword in KEYWORDS:
-            print(f"\n[{time.strftime('%H:%M:%S')}] Đang quét: '{keyword}'")
-            items = search_mercari(keyword)
-            new_count = 0
-
-            for item in items:
-                item_id = item.get("id", "")
-                if not item_id or item_id in seen_ids:
-                    continue
+            keyword = keyword.strip()
+            if not keyword:
+                continue
+            items = scan_keyword(keyword)
+            new_items = [i for i in items if str(i.get("id")) not in seen_ids]
+            for item in new_items:
+                item_id = str(item.get("id"))
                 seen_ids.add(item_id)
-                if first_run:
-                    continue  # Lần đầu chỉ lưu, không gửi thông báo
-                new_count += 1
-                name  = item.get("name", "?")
-                price = item.get("price", "?")
-                print(f"  ✅ Mới: {name} — ¥{price:,}")
-                send_telegram(item)
-                send_discord(item)
-                time.sleep(1)
+                send_telegram_message(format_item_message(item, keyword))
+                log.info("Da bao hang moi: %s (%s)", item.get("name"), item_id)
+            if new_items:
+                save_seen_items(seen_ids)
+            time.sleep(3)
 
-            if first_run:
-                print(f"  ℹ️  Lần đầu chạy: đã lưu {len(items)} sản phẩm hiện có.")
-            elif new_count == 0:
-                print("  Không có listing mới.")
-
-        save_seen_ids(seen_ids)
-        first_run = False
-        print(f"\n⏳ Chờ {SCAN_INTERVAL} giây...")
-        time.sleep(SCAN_INTERVAL)
+        log.info("Hoan tat 1 vong quet luc %s - cho %ds.", datetime.now().strftime("%H:%M:%S"), SCAN_INTERVAL_SECONDS)
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
