@@ -1,10 +1,12 @@
 import os
 import json
 import time
+import threading
 import logging
 from datetime import datetime
 
 import requests
+from flask import Flask
 from playwright.sync_api import sync_playwright
 
 KEYWORDS = [
@@ -27,31 +29,56 @@ KEYWORDS = [
     "DIOR ワンピース",
 ]
 
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "180"))
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-SEEN_ITEMS_FILE = os.environ.get("SEEN_ITEMS_FILE", "seen_items.json")
+# --- Toc do quet: chinh o day neu can ---
+# Thoi gian nghi giua 2 vong quet day du (tat ca tu khoa)
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))  # 5 phut
+# Thoi gian nghi giua tung tu khoa trong 1 vong quet
+DELAY_BETWEEN_KEYWORDS_SECONDS = int(os.environ.get("DELAY_BETWEEN_KEYWORDS_SECONDS", "8"))
+
+SEEN_IDS_FILE = os.environ.get("SEEN_IDS_FILE", "seen_ids.json")
+ITEMS_FILE = os.environ.get("ITEMS_FILE", "found_items.json")
+MAX_ITEMS_KEPT = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("mercari_scanner")
+log = logging.getLogger("mercari_dashboard")
 
-_debug_done = False
+app = Flask(__name__)
+
+_lock = threading.Lock()
+_seen_ids = set()          # tat ca ID da tung thay (de khong bao lai)
+_items_by_id = {}          # chi chua hang MOI THAT SU (hien thi len web)
 
 
-def load_seen_items():
-    if os.path.exists(SEEN_ITEMS_FILE):
+def load_state():
+    global _seen_ids, _items_by_id
+    if os.path.exists(SEEN_IDS_FILE):
         try:
-            with open(SEEN_ITEMS_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+            with open(SEEN_IDS_FILE, "r", encoding="utf-8") as f:
+                _seen_ids = set(json.load(f))
         except Exception:
-            pass
-    return set()
+            _seen_ids = set()
+    if os.path.exists(ITEMS_FILE):
+        try:
+            with open(ITEMS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                _items_by_id = {i["id"]: i for i in data}
+        except Exception:
+            _items_by_id = {}
 
 
-def save_seen_items(seen_ids):
-    ids_list = list(seen_ids)[-5000:]
-    with open(SEEN_ITEMS_FILE, "w", encoding="utf-8") as f:
+def save_seen_ids():
+    with _lock:
+        ids_list = list(_seen_ids)[-10000:]
+    with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
         json.dump(ids_list, f)
+
+
+def save_items():
+    with _lock:
+        items = sorted(_items_by_id.values(), key=lambda x: x["found_at"], reverse=True)
+        items = items[:MAX_ITEMS_KEPT]
+    with open(ITEMS_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False)
 
 
 def find_items_recursive(node, found=None):
@@ -70,21 +97,23 @@ def find_items_recursive(node, found=None):
 
 
 def scan_keyword_with_browser(page, keyword: str) -> list:
-    global _debug_done
     captured_json = []
 
     def handle_response(response):
         try:
             ctype = response.headers.get("content-type", "")
             if "application/json" in ctype and response.status == 200:
-                body = response.json()
-                captured_json.append(body)
+                captured_json.append(response.json())
         except Exception:
             pass
 
     page.on("response", handle_response)
-
-    url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale"
+    # sort=created_time&order=desc -> sap xep theo "moi nhat" (Mercari that su),
+    # thay vi mac dinh "de xuat" (co the tron hang cu duoc day len do quang cao PR)
+    url = (
+        f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}"
+        f"&status=on_sale&sort=created_time&order=desc"
+    )
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
         page.wait_for_timeout(2000)
@@ -92,12 +121,7 @@ def scan_keyword_with_browser(page, keyword: str) -> list:
         log.error("Loi khi mo trang cho tu khoa '%s': %s", keyword, e)
         page.remove_listener("response", handle_response)
         return []
-
     page.remove_listener("response", handle_response)
-
-    if not _debug_done:
-        _debug_done = True
-        log.info("[DEBUG] So goi JSON bat duoc: %d", len(captured_json))
 
     all_items = []
     for blob in captured_json:
@@ -109,37 +133,20 @@ def scan_keyword_with_browser(page, keyword: str) -> list:
     return list(unique.values())
 
 
-def send_telegram_message(text: str):
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(
-            api_url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log.error("Gui Telegram that bai: %s", resp.text)
-    except requests.RequestException as e:
-        log.error("Loi ket noi Telegram: %s", e)
+def background_scanner():
+    global _seen_ids, _items_by_id
+    load_state()
 
+    is_first_run = len(_seen_ids) == 0
+    if is_first_run:
+        log.info("Lan chay dau tien - se chi ghi nho hang hien co, KHONG hien len trang web.")
+    else:
+        log.info("Da co %d ID trong lich su, %d item dang hien thi.", len(_seen_ids), len(_items_by_id))
 
-def format_item_message(item: dict, keyword: str) -> str:
-    item_id = item.get("id", "")
-    name = item.get("name", "(khong co ten)")
-    price = item.get("price", "?")
-    item_url = f"https://jp.mercari.com/item/{item_id}"
-    return f"Hang moi: {keyword}\n{name}\nGia: {price} yen\n{item_url}"
-
-
-def main():
-    log.info("Bat dau mercari_scanner (che do trinh duyet ao) - tu khoa: %s", KEYWORDS)
-    seen_ids = load_seen_items()
-    log.info("Da co %d item trong lich su.", len(seen_ids))
+    log.info(
+        "Bat dau quet nen - %d tu khoa, nghi %ds/tu khoa, %ds/vong.",
+        len(KEYWORDS), DELAY_BETWEEN_KEYWORDS_SECONDS, SCAN_INTERVAL_SECONDS,
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -151,6 +158,8 @@ def main():
             locale="ja-JP",
         )
         page = context.new_page()
+
+        first_pass = is_first_run
 
         while True:
             for keyword in KEYWORDS:
@@ -165,24 +174,102 @@ def main():
 
                 log.info("Tu khoa '%s': tim thay %d item.", keyword, len(items))
 
-                new_items = [i for i in items if str(i.get("id")) not in seen_ids]
-                for item in new_items:
-                    item_id = str(item.get("id"))
-                    seen_ids.add(item_id)
-                    send_telegram_message(format_item_message(item, keyword))
-                    log.info("Da bao hang moi: %s (%s)", item.get("name"), item_id)
-                if new_items:
-                    save_seen_items(seen_ids)
+                now = datetime.now().isoformat()
+                truly_new_count = 0
+                with _lock:
+                    for item in items:
+                        item_id = str(item.get("id"))
+                        if item_id in _seen_ids:
+                            continue
+                        _seen_ids.add(item_id)
+                        if not first_pass:
+                            _items_by_id[item_id] = {
+                                "id": item_id,
+                                "name": item.get("name", "(khong co ten)"),
+                                "price": item.get("price", "?"),
+                                "keyword": keyword,
+                                "found_at": now,
+                                "url": f"https://jp.mercari.com/item/{item_id}",
+                            }
+                            truly_new_count += 1
 
-                time.sleep(3)
+                save_seen_ids()
+                if truly_new_count > 0:
+                    save_items()
+                    log.info("-> %d hang MOI THAT SU vua duoc them vao trang web.", truly_new_count)
+
+                time.sleep(DELAY_BETWEEN_KEYWORDS_SECONDS)
+
+            if first_pass:
+                log.info("Da hoan tat vong ghi nho dau tien. Tu vong sau se hien hang moi that su len web.")
+                first_pass = False
 
             log.info(
-                "Hoan tat 1 vong quet luc %s - cho %ds.",
+                "Hoan tat 1 vong quet luc %s - cho %ds truoc vong sau.",
                 datetime.now().strftime("%H:%M:%S"),
                 SCAN_INTERVAL_SECONDS,
             )
             time.sleep(SCAN_INTERVAL_SECONDS)
 
 
+PAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="30">
+<title>Mercari - Hang moi</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }}
+  h1 {{ font-size: 18px; }}
+  .empty {{ color: #888; margin-top: 20px; }}
+  .item {{ display: flex; justify-content: space-between; align-items: center;
+          background: #1c1c1c; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; }}
+  .item a {{ color: #7ab8ff; text-decoration: none; font-weight: 600; }}
+  .meta {{ font-size: 12px; color: #999; margin-top: 4px; }}
+  .price {{ font-weight: 700; color: #ffd166; white-space: nowrap; margin-left: 12px; }}
+</style>
+</head>
+<body>
+<h1>Hang moi tren Mercari ({count} san pham)</h1>
+{rows}
+</body>
+</html>
+"""
+
+ROW_TEMPLATE = """
+<div class="item">
+  <div>
+    <a href="{url}" target="_blank">{name}</a>
+    <div class="meta">{keyword} &middot; phat hien luc {found_at}</div>
+  </div>
+  <div class="price">{price} yen</div>
+</div>
+"""
+
+
+@app.route("/")
+def index():
+    with _lock:
+        items = sorted(_items_by_id.values(), key=lambda x: x["found_at"], reverse=True)
+    if not items:
+        rows = '<div class="empty">Chua co hang moi nao duoc phat hien. Trang se tu lam moi moi 30 giay.</div>'
+    else:
+        rows = "".join(
+            ROW_TEMPLATE.format(
+                url=i["url"],
+                name=i["name"],
+                keyword=i["keyword"],
+                found_at=i["found_at"][:19].replace("T", " "),
+                price=i["price"],
+            )
+            for i in items[:200]
+        )
+    return PAGE_TEMPLATE.format(count=len(items), rows=rows)
+
+
 if __name__ == "__main__":
-    main()
+    t = threading.Thread(target=background_scanner, daemon=True)
+    t.start()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
